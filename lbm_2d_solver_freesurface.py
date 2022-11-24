@@ -30,11 +30,11 @@ lattice_vector = ti.Vector.field(2, ti.f32, shape=9)
 reverse_direction = ti.field(ti.i8, shape=9)
 
 # Viscosity define
-niu = 0.02
+niu = 0.2005
 # 由流体粘度 计算流体松弛时间tau
 tau = 3.0 * niu + 0.5
 inv_tau = 1.0 / tau
-rho_gas = 0.01
+rho_gas = 0.0005
 
 np_arr = np.array([4.0 / 9.0, 1.0 / 9.0, 1.0 / 9.0, 1.0 / 9.0, 1.0 / 9.0, 1.0 / 36.0,
                    1.0 / 36.0, 1.0 / 36.0, 1.0 / 36.0], dtype=np.float32)
@@ -57,8 +57,18 @@ cycle_position = ti.Vector([128, 256])
 def init():
     for i, j in rho:
         v[i, j] = ti.Vector([0.0, 0.0])
-        rho[i, j] = 1.0
-        type_mask[i, j] = 0
+        if j > 256:
+            rho[i, j] = 1.0
+            mass[0, i, j] = 1.0
+            type_mask[i, j] = 0
+        elif j == 256:
+            rho[i, j] = 1.0
+            mass[0, i, j] = 1.0
+            type_mask[i, j] = 1
+        else:
+            rho[i, j] = 0.05
+            mass[0, i, j] = 0.0
+            type_mask[i, j] = 2
         # vector = ti.Vector([ti.cast(i, ti.f32), ti.cast(j, ti.f32)])
         # vector = vector - cycle_position
         # d = ti.math.dot(vector, vector)
@@ -96,10 +106,10 @@ def collision_stream():
                 j_prev = j - ti.cast(lattice_vector[direction][1], ti.i32)
                 # dt = 1
                 if type_mask[i_prev, j_prev] == 2:
-                    f_x[next_bank, i, j, direction] = f_eq_gas(rho_gas, v[i, j], direction) + f_eq(i_prev, j_prev,
-                                                                                                   reverse_direction[
-                                                                                                       direction]) - \
-                                                      f_x[fx_bank_sel[None], i, j, direction]
+                    f_x[next_bank, i, j, direction] = f_eq_gas(rho_gas, v[i, j], direction) + f_eq_gas(rho_gas, v[i, j],
+                                                                                                       reverse_direction[
+                                                                                                           direction]) - \
+                                                      f_x[fx_bank_sel[None], i, j, reverse_direction[direction]]
                 else:
                     f_x[next_bank, i, j, direction] = (1 - inv_tau) * f_x[
                         fx_bank_sel[None], i_prev, j_prev, direction] + inv_tau * f_eq(i_prev, j_prev, direction)
@@ -120,18 +130,12 @@ def mass_stream():
         if type_mask[i, j] == 2 or type_mask[i, j] == 3:
             continue
         dm = 0.
-        i_next_f = i + lattice_vector[direction][0]
-        i_next = ti.cast(i_next_f, ti.i32)
-        j_next_f = j + lattice_vector[direction][1]
-        j_next = ti.cast(j_next_f, ti.i32)
         if type_mask[i, j] == 0:
-            for direction in ti.static(range(9)):
-                sdm = 0.
-                sdm -= f_x[fx_bank, i, j, direction]
-                sdm += f_x[fx_bank, i_next, j_next, reverse_direction[direction]]
-                dm += sdm
+            mass[mass_bank_next, i, j] = rho[i, j]
         else:
             for direction in ti.static(range(9)):
+                i_next = i + ti.cast(lattice_vector[direction][0], ti.i32)
+                j_next = j + ti.cast(lattice_vector[direction][1], ti.i32)
                 sdm = 0.
                 sdm -= f_x[fx_bank, i, j, direction]
                 sdm += f_x[fx_bank, i_next, j_next, reverse_direction[direction]]
@@ -139,7 +143,59 @@ def mass_stream():
                     dm += sdm
                 elif type_mask[i_next, j_next] == 1:
                     dm += sdm * 0.5 * (volume_fraction[i, j] + volume_fraction[i_next, j_next])
-        mass[mass_bank_next, i, j] = mass[mass_bank, i, j] + dm
+            mass[mass_bank_next, i, j] = mass[mass_bank, i, j] + dm
+    mass_bank_sel[None] = mass_bank_next
+
+
+@ti.kernel
+def state_update():
+    mass_bank = mass_bank_sel[None]
+    for i, j in ti.ndrange((1, nx - 1), (1, ny - 1)):
+        if type_mask[i, j] == 1:
+            if mass[mass_bank, i, j] > (1.001) * rho[i, j]:
+                type_mask[i, j] = 4  # filled cell
+            elif mass[mass_bank, i, j] < (-0.001) * rho[i, j]:
+                type_mask[i, j] = 6  # emptied cell
+    for i, j in ti.ndrange((1, nx - 1), (1, ny - 1)):
+        if type_mask[i, j] == 4:
+            last_mass = mass[mass_bank, i, j] - rho[i, j]
+            last_mass /= 8
+            mass[mass_bank, i, j] = rho[i, j]
+            type_mask[i, j] = 0
+            for direction in ti.static(range(9)):
+                i_next = i + ti.cast(lattice_vector[direction][0], ti.i32)
+                j_next = j + ti.cast(lattice_vector[direction][1], ti.i32)
+                if type_mask[i_next, j_next] == 2:
+                    type_mask[i_next, j_next] = 5  # new interface
+                elif type_mask[i_next, j_next] == 6:
+                    type_mask[i_next, j_next] = 1
+                mass[mass_bank, i_next, j_next] += last_mass
+
+    for i, j in ti.ndrange((1, nx - 1), (1, ny - 1)):
+        if type_mask[i, j] == 6:
+            last_mass = mass[mass_bank, i, j]  # ignore for temporal
+            type_mask[i, j] = 2
+            mass[mass_bank, i, j] = 0
+
+    for i, j in ti.ndrange((1, nx - 1), (1, ny - 1)):
+        if type_mask[i, j] == 5:
+            v_avg = ti.Vector([0.0, 0.0])
+            cnt = 1
+            for direction in ti.static(range(9)):
+                i_next = i + ti.cast(lattice_vector[direction][0], ti.i32)
+                j_next = j + ti.cast(lattice_vector[direction][1], ti.i32)
+                if type_mask[i_next, j_next] == 0:
+                    v_avg += v[i_next, j_next]
+                    cnt += 1
+            if cnt > 1:
+                cnt -= 1
+            v_avg /= cnt
+            for direction in ti.static(range(9)):
+                f_x[fx_bank_sel[None], i, j, direction] = f_eq_gas(rho_gas, v_avg, direction)
+            type_mask[i, j] = 1
+
+    for i, j in ti.ndrange((1, nx - 1), (1, ny - 1)):
+        volume_fraction[i, j] = mass[mass_bank, i, j] / rho[i, j]
 
 
 @ti.kernel
@@ -170,20 +226,25 @@ def boundary_dirichlet(boundary_v, i_b, j_b, i_inside, j_inside):
 @ti.kernel
 def get_display_var():
     for i, j in ti.ndrange(nx, ny):
-        display_var[i, j] = ti.sqrt(v[i, j][0] ** 2.0 + v[i, j][1] ** 2.0)
+        # display_var[i, j] = ti.sqrt(v[i, j][0] ** 2.0 + v[i, j][1] ** 2.0)
+        # display_var[i, j] = mass[mass_bank_sel[None], i, j]
+        display_var[i, j] = type_mask[i, j]
+        # display_var[i, j] = rho[i, j]
+        # display_var[i, j] = volume_fraction[i, j] + 2.0
 
 
 # Boundary condition
 @ti.kernel
 def boundary_condition():
-    # Left and right
-    for j in ti.ndrange(1, ny - 1):
-        boundary_dirichlet(ti.Vector([0.0, 0.0]), 0, j, 1, j)
-        boundary_dirichlet(ti.Vector([0.0, 0.0]), nx - 1, j, nx - 2, j)
+    # return
+    # # Left and right
+    for j in ti.ndrange(ny - 1):
+        boundary_dirichlet(ti.Vector([0.00, 0.0]), 0, j, 1, j)
+        boundary_dirichlet(ti.Vector([0.00, 0.0]), nx - 1, j, nx - 2, j)
     # Top and bottom
     for i in ti.ndrange(nx):
-        boundary_dirichlet(ti.Vector([0.0, 0.0]), i, 0, i, 1)
-        boundary_dirichlet(ti.Vector([0.2, 0.0]), i, ny - 1, i, ny - 2)
+        boundary_dirichlet(ti.Vector([0.00, 0.0]), i, 0, i, 1)
+        boundary_dirichlet(ti.Vector([0.08, 0.0]), i, ny - 1, i, ny - 2)
 
 
 def solve():
@@ -193,8 +254,10 @@ def solve():
         collision_stream()
         update_rho_v()
         boundary_condition()
-        if (i % 100 == 0):
-            print(str(i) + ' updates \n')
+        mass_stream()
+        state_update()
+        if (i % 1 == 0):
+            # print(str(i) + ' updates \n')
             get_display_var()
             img = cm.plasma(display_var.to_numpy() / 0.15)
             gui.set_image(img)
