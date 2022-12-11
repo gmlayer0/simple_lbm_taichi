@@ -54,12 +54,12 @@ def init():
         vector = ti.Vector([ti.cast(i, ti.f32), ti.cast(j, ti.f32)])
         vector = vector - cycle_position
         d = ti.math.dot(vector, vector)
-        if d <= 100.0:
-            solid_mask[i, j] = 1
-    # for i in ti.ndrange(20):
-    #     solid_mask[80 + i, 90 - i] = 1
-    #     solid_mask[81 + i, 90 - i] = 1
-    #     solid_mask[82 + i, 90 - i] = 1
+        # if d <= 100.0:
+        #     solid_mask[i, j] = 1
+    for i in ti.ndrange(20):
+        solid_mask[80 + i, 90 - i] = 1
+        solid_mask[81 + i, 90 - i] = 1
+        solid_mask[82 + i, 90 - i] = 1
 
 
 @ti.func
@@ -128,8 +128,12 @@ def boundary_empty(boundary_v, i_b, j_b, i_inside, j_inside):
 @ti.kernel
 def get_display_var():
     for i, j in ti.ndrange(nx, ny):
-        display_var[i, j] = ti.sqrt(v[i, j][0] ** 2.0 + v[i, j][1] ** 2.0)
-        # display_var[i, j] = rho[i, j]
+        display_var[i, j] = 9 * ti.sqrt(v[i, j][0] ** 2.0 + v[i, j][1] ** 2.0)
+        # display_var[i, j] = ti.sqrt(v[i, j][0] ** 2.0 + v[i, j][1] ** 2.0)
+        # display_var[i, j] = 100 * mass[mass_bank_sel[None], i, j]
+        # display_var[i, j] = type_mask[i, j]
+        # display_var[i, j] = 100 * rho[i, j]
+        # display_var[i, j] = volume_fraction[i, j] + 2.0
 
 
 # Boundary condition
@@ -165,8 +169,8 @@ def solve():
         if (i % 100 == 0):
             print(str(i) + ' updates \n')
             get_display_var()
-            img = cm.plasma(display_var.to_numpy() / 0.15)
-            gui.set_image(img)
+            # img = cm.plasma(display_var.to_numpy() / 0.15)
+            gui.set_image(display_var)
             gui.show()
 
 

@@ -57,11 +57,15 @@ cycle_position = ti.Vector([128, 256])
 def init():
     for i, j in rho:
         v[i, j] = ti.Vector([0.0, 0.0])
-        if j > 256:
+        if j > 256 and i > 256:
             rho[i, j] = 1.0
             mass[0, i, j] = 1.0
             type_mask[i, j] = 0
-        elif j == 256:
+        elif j == 256 and i > 256:
+            rho[i, j] = 1.0
+            mass[0, i, j] = 1.0
+            type_mask[i, j] = 1
+        elif i == 256 and j > 256:
             rho[i, j] = 1.0
             mass[0, i, j] = 1.0
             type_mask[i, j] = 1
@@ -150,52 +154,55 @@ def mass_stream():
 @ti.kernel
 def state_update():
     mass_bank = mass_bank_sel[None]
+    fx_bank = fx_bank_sel[None]
     for i, j in ti.ndrange((1, nx - 1), (1, ny - 1)):
         if type_mask[i, j] == 1:
             if mass[mass_bank, i, j] > (1.001) * rho[i, j]:
-                type_mask[i, j] = 4  # filled cell
+                type_mask[i, j] = 0 + 4  # filed cell
             elif mass[mass_bank, i, j] < (-0.001) * rho[i, j]:
-                type_mask[i, j] = 6  # emptied cell
+                type_mask[i, j] = 2 + 4  # emptyed cell
     for i, j in ti.ndrange((1, nx - 1), (1, ny - 1)):
-        if type_mask[i, j] == 4:
-            last_mass = mass[mass_bank, i, j] - rho[i, j]
-            last_mass /= 8
-            mass[mass_bank, i, j] = rho[i, j]
-            type_mask[i, j] = 0
+        if type_mask[i, j] == 2:
+            interfaced = False
+            rho_avg = 0.
+            v_avg = ti.Vector([0, 0])
+            cnt = 0
             for direction in ti.static(range(9)):
                 i_next = i + ti.cast(lattice_vector[direction][0], ti.i32)
                 j_next = j + ti.cast(lattice_vector[direction][1], ti.i32)
-                if type_mask[i_next, j_next] == 2:
-                    type_mask[i_next, j_next] = 5  # new interface
-                elif type_mask[i_next, j_next] == 6:
-                    type_mask[i_next, j_next] = 1
-                mass[mass_bank, i_next, j_next] += last_mass
-
-    for i, j in ti.ndrange((1, nx - 1), (1, ny - 1)):
-        if type_mask[i, j] == 6:
-            last_mass = mass[mass_bank, i, j]  # ignore for temporal
-            type_mask[i, j] = 2
-            mass[mass_bank, i, j] = 0
-
-    for i, j in ti.ndrange((1, nx - 1), (1, ny - 1)):
-        if type_mask[i, j] == 5:
-            v_avg = ti.Vector([0.0, 0.0])
-            cnt = 1
-            for direction in ti.static(range(9)):
-                i_next = i + ti.cast(lattice_vector[direction][0], ti.i32)
-                j_next = j + ti.cast(lattice_vector[direction][1], ti.i32)
-                if type_mask[i_next, j_next] == 0:
-                    v_avg += v[i_next, j_next]
+                if type_mask[i_next, j_next] == 0 + 4:
+                    #               set to new interface
+                    interfaced = True
+                if type_mask[i_next, j_next] <= 1:
                     cnt += 1
-            if cnt > 1:
-                cnt -= 1
-            v_avg /= cnt
-            for direction in ti.static(range(9)):
-                f_x[fx_bank_sel[None], i, j, direction] = f_eq_gas(rho_gas, v_avg, direction)
-            type_mask[i, j] = 1
+                    rho_avg += rho[i_next, j_next]
+                    v_avg += v[i_next, j_next]
+            if interfaced:
+                type_mask[i, j] = 1
+                mass[mass_bank, i, j] = 0
+                if cnt != 0:
+                    v_avg /= cnt
+                    rho_avg /= cnt
+
+                for direction in ti.static(range(9)):
+                    f_x[fx_bank, i, j, direction] = f_eq_gas(rho_avg, v_avg, direction)
 
     for i, j in ti.ndrange((1, nx - 1), (1, ny - 1)):
-        volume_fraction[i, j] = mass[mass_bank, i, j] / rho[i, j]
+        if type_mask[i, j] == 0:
+            interfaced = False
+            for direction in ti.static(range(9)):
+                i_next = i + ti.cast(lattice_vector[direction][0], ti.i32)
+                j_next = j + ti.cast(lattice_vector[direction][1], ti.i32)
+                if type_mask[i_next, j_next] == 2 + 4:
+                    #               set to new interface
+                    interfaced = True
+            if interfaced:
+                type_mask[i, j] = 1
+                mass[mass_bank, i, j] = rho[i, j]
+
+    for i, j in ti.ndrange((1, nx - 1), (1, ny - 1)):
+        if type_mask[i, j] >= 4:
+            type_mask[i, j] = type_mask[i, j] - 4
 
 
 @ti.kernel
@@ -236,15 +243,15 @@ def get_display_var():
 # Boundary condition
 @ti.kernel
 def boundary_condition():
-    # return
+    return
     # # Left and right
     for j in ti.ndrange(ny - 1):
         boundary_dirichlet(ti.Vector([0.00, 0.0]), 0, j, 1, j)
         boundary_dirichlet(ti.Vector([0.00, 0.0]), nx - 1, j, nx - 2, j)
     # Top and bottom
     for i in ti.ndrange(nx):
-        boundary_dirichlet(ti.Vector([0.00, 0.0]), i, 0, i, 1)
-        boundary_dirichlet(ti.Vector([0.08, 0.0]), i, ny - 1, i, ny - 2)
+        boundary_dirichlet(ti.Vector([0.00, 0.01]), i, 0, i, 1)
+        boundary_dirichlet(ti.Vector([0.00, 0.01]), i, ny - 1, i, ny - 2)
 
 
 def solve():
@@ -259,7 +266,8 @@ def solve():
         if (i % 1 == 0):
             # print(str(i) + ' updates \n')
             get_display_var()
-            img = cm.plasma(display_var.to_numpy() / 0.15)
+            # img = cm.plasma(display_var.to_numpy() / 0.15)
+            img = display_var.to_numpy()
             gui.set_image(img)
             gui.show()
 
