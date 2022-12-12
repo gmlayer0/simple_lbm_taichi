@@ -1,7 +1,7 @@
 import taichi as ti
 import numpy as np
 
-ti.init(arch=ti.gpu, dynamic_index=True, kernel_profiler=False, print_ir=False)
+ti.init(arch=ti.cpu, dynamic_index=True, kernel_profiler=False, print_ir=False)
 
 eq_v_weight_d2q9 = ti.field(ti.f32, shape=9)
 lattice_vector_d2q9 = ti.Vector.field(2, ti.i8, shape=9)
@@ -27,12 +27,12 @@ class LbmD2Q9FreeSurface:
         self.display_var = ti.field(ti.f32, shape=(self.nx, self.ny))
 
         # Viscosity define
-        self.niu = 0.0255
+        self.niu = 0.0005
         # 由流体粘度 计算流体松弛时间tau
         self.tau = 3.0 * self.niu + 0.5
         self.inv_tau = 1.0 / self.tau
 
-        self.global_force = ti.Vector([0.0, -0.0007])
+        self.global_force = ti.Vector([0.0000, -0.0000])
 
         # Lower 4 flag bits is used to mark empty block, fluid block or interface block. (x & 15)
         # 0 for fluid 1 for interface 2 for empty.
@@ -73,6 +73,8 @@ class LbmD2Q9FreeSurface:
 
     @ti.func
     def get_lower_flag(self, x, y):
+        # if self.flag[x, y] & 15 > 7:
+        #     print(self.flag[x, y] & 15, self.flag[x, y])
         return self.flag[x, y] & 15
 
     @ti.func
@@ -127,24 +129,21 @@ class LbmD2Q9FreeSurface:
     def std_streaming(self):
         f_x_bank = self.f_x_bank_sel[None]
         f_x_bank_next = (f_x_bank + 1) & 1
-        for x, y in ti.ndrange((1, self.nx - 1), (1, self.ny - 1)):
+        # for x, y in ti.ndrange((1, self.nx - 1), (1, self.ny - 1)):
+        for x, y in ti.ndrange(self.nx, self.ny):
             if self.get_lower_flag(x, y) <= 1:
                 # standard streaming step
                 for direction in ti.static(range(9)):
                     n_x, n_y = self.get_neighbor_index_n(x, y, direction)
                     self.f_x[f_x_bank_next, x, y, direction] = self.f_x[f_x_bank, n_x, n_y, direction]
-        return
 
-    @ti.kernel
-    def interface_streaming(self):
-        f_x_bank = self.f_x_bank_sel[None]
-        f_x_bank_next = (f_x_bank + 1) & 1
-        for x, y in ti.ndrange((1, self.nx - 1), (1, self.ny - 1)):
-            # special handling for interface cell
             if self.get_lower_flag(x, y) == 1:
                 normal = self.get_surface_normal(x, y)
                 has_fluid_neighbors = False
                 has_empty_neighbors = False
+                atmosphere_pressure = 1.0
+                cur_density = self.get_density(f_x_bank, x, y)
+                velocity = self.get_velocity(f_x_bank, x, y, cur_density)
                 for direction in ti.static([0, 1, 2, 3, 5, 6, 7, 8]):
                     n_x, n_y = self.get_neighbor_index_n(x, y, direction)
                     neighbor_is_empty = self.get_lower_flag(n_x, n_y) == 2
@@ -152,40 +151,40 @@ class LbmD2Q9FreeSurface:
                     has_empty_neighbors = has_empty_neighbors or neighbor_is_empty
                     has_fluid_neighbors = has_fluid_neighbors or neighbor_is_fluid
 
-                    dot = -lattice_vector_d2q9[direction][0] * normal[0] - lattice_vector_d2q9[direction][1] * normal[1]
+                    dot = lattice_vector_d2q9[8 - direction][0] * normal[0] + lattice_vector_d2q9[8 - direction][1] * \
+                          normal[1]
                     in_normal_direction = dot > 0.0
 
-                    if in_normal_direction or has_empty_neighbors:
+                    if in_normal_direction or neighbor_is_empty:
                         # distribution function need to be reconstruction
-                        atmosphere_pressure = 1.0
-                        cur_density = self.get_density(f_x_bank, x, y)
-                        velocity = self.get_velocity(f_x_bank, x, y, cur_density)
-                        self.f_x[f_x_bank_next, x, y, direction] = self.cal_feq(cur_density, velocity,
+                        self.f_x[f_x_bank_next, x, y, direction] = self.cal_feq(atmosphere_pressure, velocity,
                                                                                 8 - direction) + self.cal_feq(
-                            cur_density, velocity, direction) - self.f_x[f_x_bank, x, y, 8 - direction]
+                            atmosphere_pressure, velocity, direction) - self.f_x[f_x_bank, x, y, 8 - direction]
                 is_standard_cell = has_fluid_neighbors and has_empty_neighbors
                 if is_standard_cell:
                     self.set_higher_flag(x, y, 0)
                 elif not has_fluid_neighbors:
                     self.set_higher_flag(x, y, 1)
-                else:
+                elif not has_empty_neighbors:
                     self.set_higher_flag(x, y, 2)
 
     @ti.kernel
     def stream_mass(self):
         f_x_bank = self.f_x_bank_sel[None]
         f_x_bank_next = (f_x_bank + 1) & 1
-        for x, y in ti.ndrange((1, self.nx - 1), (1, self.ny - 1)):
+        self.f_x_bank_sel[None] = f_x_bank_next
+        # for x, y in ti.ndrange((1, self.nx - 1), (1, self.ny - 1)):
+        for x, y in ti.ndrange(self.nx, self.ny):
             delta_mass = 0.0
             if self.get_lower_flag(x, y) != 1:
                 continue
             cur_fluid_fraction = self.get_fluid_fraction(x, y)
             for direction in ti.static([0, 1, 2, 3, 5, 6, 7, 8]):
                 n_x, n_y = self.get_neighbor_index_p(x, y, direction)
-                if self.get_lower_flag(x, y) == 0:
+                if self.get_lower_flag(n_x, n_y) == 0:
                     delta_mass += self.f_x[f_x_bank, n_x, n_y, 8 - direction] - self.f_x[
-                        f_x_bank, n_x, n_y, direction]
-                elif self.get_lower_flag(x, y) == 1:
+                        f_x_bank, x, y, direction]
+                elif self.get_lower_flag(n_x, n_y) == 1:
                     # exchange mass betweem interface
                     neigh_fluid_fraction = self.get_fluid_fraction(n_x, n_y)
                     s_e = self.cal_se(x, y, direction)
@@ -197,22 +196,26 @@ class LbmD2Q9FreeSurface:
     def collision(self):
         f_x_bank = self.f_x_bank_sel[None]
         f_x_bank_next = (f_x_bank + 1) & 1
-        for x, y in ti.ndrange((1, self.nx - 1), (1, self.ny - 1)):
-            cur_density = self.get_density(f_x_bank, x, y)
-            cur_velocity = self.get_velocity(f_x_bank, x, y, cur_density)
-            for direction in ti.static(range(9)):
-                f_eq = self.cal_feq(cur_density, cur_velocity, direction)
-                self.set_post_collision_distributions_bgk(f_x_bank, x, y, direction, self.inv_tau, f_eq)
-            cur_density = self.get_density(f_x_bank, x, y)
-            if self.get_lower_flag(x, y) == 0:
-                self.mass[x, y] = cur_density
-            else:
-                self.fraction[x, y] = self.mass[x, y] / cur_density
+        # for x, y in ti.ndrange((1, self.nx - 1), (1, self.ny - 1)):
+        for x, y in ti.ndrange(self.nx, self.ny):
+            if self.get_lower_flag(x, y) <= 1:
+                cur_density = self.get_density(f_x_bank, x, y)
+                cur_velocity = self.get_velocity(f_x_bank, x, y, cur_density)
+                cur_velocity = cur_velocity + self.global_force * self.tau
+                for direction in ti.static(range(9)):
+                    f_eq = self.cal_feq(cur_density, cur_velocity, direction)
+                    self.set_post_collision_distributions_bgk(f_x_bank, x, y, direction, self.inv_tau, f_eq)
+                cur_density = self.get_density(f_x_bank, x, y)
+                if self.get_lower_flag(x, y) == 0:
+                    self.mass[x, y] = cur_density
+                else:
+                    self.fraction[x, y] = self.mass[x, y] / cur_density
         return
 
     @ti.kernel
     def potential_update(self):
-        for x, y in ti.ndrange((1, self.nx - 1), (1, self.ny - 1)):
+        # for x, y in ti.ndrange((1, self.nx - 1), (1, self.ny - 1)):
+        for x, y in ti.ndrange(self.nx, self.ny):
             if self.get_lower_flag(x, y) != 1:
                 continue
             cur_density = 0.0
@@ -221,14 +224,14 @@ class LbmD2Q9FreeSurface:
             else:
                 cur_density = 0.0
 
-            if self.fraction[x, y] > 1.0 + 0.0001:
+            if self.mass[x, y] > 1.0001 * cur_density:
                 self.set_lower_flag(x, y, 0 + 4)
-            elif self.fraction[x, y] < -0.0001:
+            elif self.mass[x, y] < -0.0001 * cur_density:
                 self.set_lower_flag(x, y, 2 + 4)
 
-            if self.fraction[x, y] < 0.1 and self.get_higher_flag(x, y) == 1:
+            if self.mass[x, y] < 0.1 * cur_density and self.get_higher_flag(x, y) == 1:
                 self.set_lower_flag(x, y, 2 + 4)
-            elif self.fraction[x, y] > 0.9 and self.get_higher_flag(x, y) == 2:
+            elif self.mass[x, y] > 0.9 * cur_density and self.get_higher_flag(x, y) == 2:
                 self.set_lower_flag(x, y, 0 + 4)
         return
 
@@ -260,7 +263,8 @@ class LbmD2Q9FreeSurface:
     def flag_reinit_1(self):
         f_x_bank = self.f_x_bank_sel[None]
         f_x_bank_next = (f_x_bank + 1) & 1
-        for x, y in ti.ndrange((1, self.nx - 1), (1, self.ny - 1)):
+        # for x, y in ti.ndrange((1, self.nx - 1), (1, self.ny - 1)):
+        for x, y in ti.ndrange(self.nx, self.ny):
             if self.get_lower_flag(x, y) == 0 + 4:
                 for direction in range(9):
                     if direction == 4:
@@ -279,7 +283,8 @@ class LbmD2Q9FreeSurface:
     def flag_reinit_2(self):
         f_x_bank = self.f_x_bank_sel[None]
         f_x_bank_next = (f_x_bank + 1) & 1
-        for x, y in ti.ndrange((1, self.nx - 1), (1, self.ny - 1)):
+        # for x, y in ti.ndrange((1, self.nx - 1), (1, self.ny - 1)):
+        for x, y in ti.ndrange(self.nx, self.ny):
             if self.get_lower_flag(x, y) == 2 + 4:
                 for direction in ti.static([0, 1, 2, 3, 5, 6, 7, 8]):
                     n_x, n_y = self.get_neighbor_index_p(x, y, direction)
@@ -332,20 +337,25 @@ class LbmD2Q9FreeSurface:
             # redistribute weights as non-interface cells have weights 0
             for direction in ti.static([0, 1, 2, 3, 5, 6, 7, 8]):
                 n_x, n_y = self.get_neighbor_index_p(x, y, direction)
-                self.mass_exchange[x, y] += (weight[direction] / normalizer) * excess_mass
+                self.mass_exchange[n_x, n_y] += (weight[direction] / normalizer) * excess_mass
         return
 
     @ti.kernel
     def mass_distribute(self):
         f_x_bank = self.f_x_bank_sel[None]
         f_x_bank_next = (f_x_bank + 1) & 1
-        for x, y in ti.ndrange((1, self.nx - 1), (1, self.ny - 1)):
+        # for x, y in ti.ndrange((1, self.nx - 1), (1, self.ny - 1)):
+        for x, y in ti.ndrange(self.nx, self.ny):
             if self.get_lower_flag(x, y) == 0 + 4:
                 self.mass_distribute_single(f_x_bank, x, y, True)
                 self.set_lower_flag(x, y, 0)
             elif self.get_lower_flag(x, y) == 2 + 4:
                 self.mass_distribute_single(f_x_bank, x, y, False)
                 self.set_lower_flag(x, y, 2)
+        for x, y in ti.ndrange(self.nx, self.ny):
+            self.mass[x, y] = self.mass[x, y] + self.mass_exchange[x, y]
+            self.fraction[x, y] = self.mass[x, y] / self.get_density(f_x_bank, x, y)
+            self.mass_exchange[x, y] = 0
         return
 
     @ti.func
@@ -363,7 +373,7 @@ class LbmD2Q9FreeSurface:
     def boundary_condition(self):
         f_x_bank = self.f_x_bank_sel[None]
         f_x_bank_next = (f_x_bank + 1) & 1
-        for x, y in ti.ndrange((1, self.nx - 1), (1, self.ny - 1)):
+        for x, y in ti.ndrange(self.nx, self.ny):
             if self.get_lower_flag(x, y) == 8 + 0:
                 self.no_slip_single(f_x_bank, x, y)
         return
@@ -372,12 +382,16 @@ class LbmD2Q9FreeSurface:
     def init(self):
         f_x_bank = self.f_x_bank_sel[None]
         f_x_bank_next = (f_x_bank + 1) & 1
-        for x, y in ti.ndrange((1, self.nx - 1), (1, self.ny - 1)):
+        for x, y in ti.ndrange(self.nx, self.ny):
             for direction in ti.static(range(9)):
                 self.f_x[f_x_bank, x, y, direction] = eq_v_weight_d2q9[direction]
                 self.f_x[f_x_bank_next, x, y, direction] = eq_v_weight_d2q9[direction]
-            if x == 0 or x == self.nx - 1 or y == 0 or y == self.ny - 1:
+                # self.f_x[f_x_bank, x, y, direction] = 0
+                # self.f_x[f_x_bank_next, x, y, direction] = 0
+            if x <= 0 or x == self.nx - 1 or y == 0 or y == self.ny - 1:
                 self.flag[x, y] = ti.u8(8)
+                self.mass[x, y] = 0.0
+                self.fraction[x, y] = 0.0
             elif x > 256:
                 self.flag[x, y] = ti.u8(0)
                 self.mass[x, y] = 1.0
@@ -401,48 +415,49 @@ class LbmD2Q9FreeSurface:
             density = self.get_density(f_x_bank, x, y)
             velocity = self.get_velocity(f_x_bank, x, y, density)
             # self.display_var[x, y] = (velocity[0] ** 2 + velocity[1] ** 2) * 10
-            self.display_var[x, y] = self.flag[x, y]
+            self.display_var[x, y] = self.flag[x, y] == 1
+            # self.display_var[x, y] = self.mass[x, y]
+            # self.display_var[x, y] = density * 5
+            # self.display_var[x, y] = self.fraction[x, y]
         return
 
     def solve(self):
         gui = ti.GUI('lbm-2d-freesurface', (self.nx, self.ny))
         self.init()
+        self.get_display_var()
+        gui.set_image(self.display_var)
+        gui.show()
         for i in range(100000):
             self.std_streaming()
             if i % 100 == 0:
                 print(1, i)
-            self.interface_streaming()
-            if i % 100 == 0:
-                print(2, i)
             self.stream_mass()
             if i % 100 == 0:
-                print(3, i)
-            f_x_bank = self.f_x_bank_sel[None]
-            self.f_x_bank_sel[None] = (f_x_bank + 1) & 1
+                print(2, i)
             if i % 100 == 0:
-                print(4, i)
+                print(3, i)
             self.collision()
             if i % 100 == 0:
-                print(5, i)
+                print(4, i)
             self.potential_update()
             if i % 100 == 0:
-                print(6, i)
+                print(5, i)
             self.flag_reinit_1()
             if i % 100 == 0:
-                print(7, i)
+                print(6, i)
             self.flag_reinit_2()
             if i % 100 == 0:
-                print(8, i)
+                print(7, i)
             self.mass_distribute()
             if i % 100 == 0:
-                print(9, i)
+                print(8, i)
             self.boundary_condition()
             if i % 100 == 0:
-                print(10, i)
+                print(9, i)
 
             self.get_display_var()
             if i % 100 == 0:
-                print(11, i)
+                print(10, i)
             gui.set_image(self.display_var)
             gui.show()
 
