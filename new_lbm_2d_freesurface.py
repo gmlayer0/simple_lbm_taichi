@@ -9,8 +9,9 @@ np_arr = np.array([[+1, +0], [+0, +1], [+1, +1], [-1, +1],
                    [0, 0],
                    [+1, -1], [-1, -1], [+0, -1], [-1, +0]], dtype=np.int8)
 lattice_vector_d2q9.from_numpy(np_arr)
-np_arr = np.array([4.0 / 9.0, 1.0 / 9.0, 1.0 / 9.0, 1.0 / 9.0, 1.0 / 9.0, 1.0 / 36.0,
-                   1.0 / 36.0, 1.0 / 36.0, 1.0 / 36.0], dtype=np.float32)
+np_arr = np.array([1.0 / 9.0, 1.0 / 9.0, 1.0 / 36.0, 1.0 / 36.0,
+                   4.0 / 9.0,
+                   1.0 / 36.0, 1.0 / 36.0, 1.0 / 9.0, 1.0 / 9.0], dtype=np.float32)
 eq_v_weight_d2q9.from_numpy(np_arr)
 
 
@@ -32,11 +33,11 @@ class LbmD2Q9FreeSurface:
         self.tau = 3.0 * self.niu + 0.5
         self.inv_tau = 1.0 / self.tau
 
-        self.global_force = ti.Vector([0.0000, -0.0000])
+        self.global_force = ti.Vector([0.0000, -0.0005])
 
         # Lower 4 flag bits is used to mark empty block, fluid block or interface block. (x & 15)
         # 0 for fluid 1 for interface 2 for empty.
-        # +4 0 for interface2fluid 2 for interface2empty
+        # +4 0 for interface to fluid, 2 for interface to empty
         # +8 0 for standstill wall.
 
         # Higher 4 flag bits is used to mark neighborhood status. (x >> 4)
@@ -64,7 +65,9 @@ class LbmD2Q9FreeSurface:
     def cal_feq(self, density, velocity, direction):
         u_dot_c = lattice_vector_d2q9[direction][0] * velocity[0] + lattice_vector_d2q9[direction][1] * velocity[1]
         u_dot_u = ti.Vector.dot(velocity, velocity)
-        return eq_v_weight_d2q9[direction] * density * (1.0 + 3.0 * u_dot_c + 4.5 * u_dot_c ** 2 - 1.5 * u_dot_u)
+        val = eq_v_weight_d2q9[direction] * density * (1.0 + 3.0 * u_dot_c + 4.5 * u_dot_c ** 2 - 1.5 * u_dot_u)
+        assert 0 <= val <= 1.1
+        return val
 
     @ti.func
     def set_post_collision_distributions_bgk(self, bank, x, y, direction, inv_tau, f_eq):
@@ -135,6 +138,7 @@ class LbmD2Q9FreeSurface:
                 # standard streaming step
                 for direction in ti.static(range(9)):
                     n_x, n_y = self.get_neighbor_index_n(x, y, direction)
+                    assert self.f_x[f_x_bank, n_x, n_y, direction] >= 0.
                     self.f_x[f_x_bank_next, x, y, direction] = self.f_x[f_x_bank, n_x, n_y, direction]
 
             if self.get_lower_flag(x, y) == 1:
@@ -252,6 +256,7 @@ class LbmD2Q9FreeSurface:
                 num_neighs = num_neighs + 1
                 avg_density = avg_density + neigh_density
                 avg_vel = avg_vel + neigh_velocity
+        assert num_neighs != 0
         avg_vel /= num_neighs
         avg_density /= num_neighs
         self.fraction[x, y] = self.mass[x, y] / avg_density
@@ -383,27 +388,34 @@ class LbmD2Q9FreeSurface:
         f_x_bank = self.f_x_bank_sel[None]
         f_x_bank_next = (f_x_bank + 1) & 1
         for x, y in ti.ndrange(self.nx, self.ny):
-            for direction in ti.static(range(9)):
-                self.f_x[f_x_bank, x, y, direction] = eq_v_weight_d2q9[direction]
-                self.f_x[f_x_bank_next, x, y, direction] = eq_v_weight_d2q9[direction]
-                # self.f_x[f_x_bank, x, y, direction] = 0
-                # self.f_x[f_x_bank_next, x, y, direction] = 0
             if x <= 0 or x == self.nx - 1 or y == 0 or y == self.ny - 1:
                 self.flag[x, y] = ti.u8(8)
                 self.mass[x, y] = 0.0
                 self.fraction[x, y] = 0.0
+                for direction in ti.static(range(9)):
+                    self.f_x[f_x_bank, x, y, direction] = self.cal_feq(0.0, ti.Vector([0., 0.]), direction)
+                    self.f_x[f_x_bank_next, x, y, direction] = self.cal_feq(0.0, ti.Vector([0., 0.]), direction)
             elif x > 256:
                 self.flag[x, y] = ti.u8(0)
                 self.mass[x, y] = 1.0
                 self.fraction[x, y] = 1.0
+                for direction in ti.static(range(9)):
+                    self.f_x[f_x_bank, x, y, direction] = self.cal_feq(1.0, ti.Vector([0., 0.]), direction)
+                    self.f_x[f_x_bank_next, x, y, direction] = self.cal_feq(1.0, ti.Vector([0., 0.]), direction)
             elif x < 256:
                 self.flag[x, y] = ti.u8(2)
                 self.mass[x, y] = 0.0
                 self.fraction[x, y] = 0.0
+                for direction in ti.static(range(9)):
+                    self.f_x[f_x_bank, x, y, direction] = self.cal_feq(0.0, ti.Vector([0., 0.]), direction)
+                    self.f_x[f_x_bank_next, x, y, direction] = self.cal_feq(0.0, ti.Vector([0., 0.]), direction)
             else:
                 self.flag[x, y] = ti.u8(1)
                 self.mass[x, y] = 0.5
                 self.fraction[x, y] = 0.5
+                for direction in ti.static(range(9)):
+                    self.f_x[f_x_bank, x, y, direction] = self.cal_feq(0.5, ti.Vector([0., 0.]), direction)
+                    self.f_x[f_x_bank_next, x, y, direction] = self.cal_feq(0.5, ti.Vector([0., 0.]), direction)
 
         return
 
@@ -415,9 +427,9 @@ class LbmD2Q9FreeSurface:
             density = self.get_density(f_x_bank, x, y)
             velocity = self.get_velocity(f_x_bank, x, y, density)
             # self.display_var[x, y] = (velocity[0] ** 2 + velocity[1] ** 2) * 10
-            self.display_var[x, y] = self.flag[x, y] == 1
+            # self.display_var[x, y] = self.flag[x, y] == 1
             # self.display_var[x, y] = self.mass[x, y]
-            # self.display_var[x, y] = density * 5
+            self.display_var[x, y] = density * 5
             # self.display_var[x, y] = self.fraction[x, y]
         return
 
