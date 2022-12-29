@@ -1,7 +1,7 @@
 import taichi as ti
 import numpy as np
 
-ti.init(arch=ti.gpu)
+ti.init(arch=ti.gpu, offline_cache=True)
 
 eq_v_weight_d2q9 = ti.field(ti.f32, shape=9)
 lattice_vector_d2q9 = ti.Vector.field(2, ti.i8, shape=9)
