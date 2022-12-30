@@ -572,8 +572,8 @@ class LbmD2Q9FreeSurface:
         return
 
     def solve(self):
-        gui = ti.GUI('lbm-2d-freesurface', (self.nx, self.ny))
-        self.init_drop()
+        gui = ti.GUI('lbm-2d-freesurface', (self.nx, self.ny), fast_gui=True)
+        self.init_water()
         self.get_display_var()
         gui.set_image(self.display_var)
         gui.show()
@@ -618,7 +618,7 @@ class LbmD2Q9FreeSurface:
             if i == 0:
                 print(9, i)
 
-            if time_record - last_print_time >= 10.0:
+            if time_record - last_print_time >= 1.0:
                 last_print_time = time_record
                 self.get_display_var()
                 # print(10, i)
